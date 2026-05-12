@@ -14,7 +14,7 @@ ENV MONGO_PORT=27017
 ENV MONGO_AUTH_DB=admin
 ENV MONGO_TARGET_DB=galv-center
 
-COPY model_incremental_train/requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 
 ENV PIP_DEFAULT_TIMEOUT=120
 ENV PIP_RETRIES=10
@@ -28,7 +28,7 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://bootst
     --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
     --retries 10 --timeout 120 -r /app/requirements.txt
 
-COPY model_incremental_train/incremental_train.py /app/incremental_train.py
+COPY incremental_train.py /app/
 RUN mkdir -p /app/output /app/logs
 
 CMD ["python", "incremental_train.py"]
