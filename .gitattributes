@@ -1,0 +1,2 @@
+deploy.sh text eol=lf
+model_incremental_train/deploy.sh text eol=lf

@@ -108,8 +108,6 @@ def sequence_processing_new(data,feature_list,U_close,threshold):
 
     # 新增列表，用于存放波动较大的序列
     wave_seqs = []
-    # 新增列表，用于存放大电流的序列
-    big_seqs = []
 
     # 计算每个序列的均值并填充序列
     for i,seq in enumerate(data):
@@ -118,10 +116,6 @@ def sequence_processing_new(data,feature_list,U_close,threshold):
             mean_val = np.mean(seq)  # 计算序的均值
             mean_val = round(mean_val, 4)
             std_dev = np.std(seq)  # 计算序列的标准差，作为波动的度量
-            # 检查序列的波动是否超过阈值
-        if mean_val > 0.5:
-            big_seqs.append((i,3))  # 如果波动大，则添加到波动序列列表
-            continue  # 跳过后续的处理步骤
         if mean_val < 0:
             labels_neg_and_closed.append((i,0))
             continue
@@ -143,7 +137,7 @@ def sequence_processing_new(data,feature_list,U_close,threshold):
             pos.append(i)
     # 转换为 np.array([[],[],[]]) 格式
     result = np.array(padded_seqs)
-    return result,labels_neg_and_closed,pos,big_seqs,wave_seqs
+    return result,labels_neg_and_closed,pos,wave_seqs
 
 # 后处理-----------------------------------------------------------------------------------------
 # 重新标签，生成离线0，关机1，运行2，工作3
@@ -179,7 +173,7 @@ def label_reset(labels,seg_data,seq_pos,labels_neg,k,mean_seg,threshold_u):
     labels_seq = generate_label_list(seg_data,sorted_all_labels)
     return labels_seq
 
-def label_reset_new(labels,seg_data,seq_pos,labels_neg,k,mean_seg,threshold_u,big_data,wave_data):
+def label_reset_new(labels,seg_data,seq_pos,labels_neg,k,mean_seg,threshold_u,wave_data):
     labels = np.array(labels)
     mean_indices = np.argsort(mean_seg)
     new_labels = labels.copy()
@@ -205,7 +199,7 @@ def label_reset_new(labels,seg_data,seq_pos,labels_neg,k,mean_seg,threshold_u,bi
     # 带位置的标签
     labels_with_pos = list(zip(seq_pos,new_labels))
     # 所有的子序列标签（包括-1）
-    all_labels = labels_neg + labels_with_pos + big_data + wave_data;
+    all_labels = labels_neg + labels_with_pos + wave_data
     sorted_all_labels = sorted(all_labels, key=lambda x: x[0])
     # 生成标签序列
     labels_seq = generate_label_list(seg_data,sorted_all_labels)

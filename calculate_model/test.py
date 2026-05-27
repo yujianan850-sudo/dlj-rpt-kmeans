@@ -33,7 +33,7 @@ def kmeans_test_new(data,loaded_file):
     # 生成训练数据
     # 处理分割后的数据，提取特征，生成测试数据集和负标签序列
     # test_data,labels_neg,seq_pos = sequence_processing(seg_data,features,U_close)
-    test_data,labels_neg,seq_pos,big_data,wave_data = sequence_processing_new(seg_data,features,U_close,0.04)
+    test_data,labels_neg,seq_pos,wave_data = sequence_processing_new(seg_data,features,U_close,0.04)
 
     # 如果测试数据为空且所有分割都被标记为负标签，则直接返回负标签
     if len(test_data) == 0:
@@ -44,7 +44,7 @@ def kmeans_test_new(data,loaded_file):
         labels = model.predict(test_data)
     # 标签生成
     # 根据预测标签和分割数据，重置标签以匹配原始数据结构
-    predict_labels = label_reset_new(labels, seg_data, seq_pos, labels_neg, k, mean_seg, U_close,big_data,wave_data)
+    predict_labels = label_reset_new(labels, seg_data, seq_pos, labels_neg, k, mean_seg, U_close, wave_data)
     return predict_labels
 
 

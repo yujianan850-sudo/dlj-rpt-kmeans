@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Incremental KMeans retrain from device_model to device_model_new.
+Incremental KMeans retrain on device_model (read/write same collection).
 
 Rules:
-  - Iterate IMEIs from device_model and device_model_new (union)
-  - Missing in device_model_new: first train with latest WINDOW_DAYS data
-  - Existing in device_model_new: keep saved pen, append after state_doc.end
-  - Train success -> update device_model_new
-  - Train fail -> keep device_model_new unchanged
-  - Export excel summary with retrain date suffix
+  - Iterate IMEIs from device_model only
+  - Has feature_matrix: incremental with saved pen from doc.end -> run_end
+  - No feature_matrix: first train with latest WINDOW_DAYS data
+  - Train success -> update device_model
+  - Train fail -> keep device_model unchanged, log reason
+  - Scheduler: every Sunday 00:00 (local time), no run on container start
+  - Logs: incremental_train_YYYYMMDD.log, retain at most 15 files
 """
 
 import datetime
@@ -43,7 +44,7 @@ WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "15"))
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
-RETRAIN_INTERVAL_DAYS = int(os.environ.get("RETRAIN_INTERVAL_DAYS", "7"))
+LOG_RETENTION_MAX = int(os.environ.get("LOG_RETENTION_MAX", "15"))
 MAX_TRAIN_COUNT = int(os.environ.get("MAX_TRAIN_COUNT", "-1"))  # -1 means train all
 WORKER_THREADS = int(os.environ.get("WORKER_THREADS", "5"))
 # legacy cap constant kept for compatibility with helper functions
@@ -61,10 +62,8 @@ MONGO_PWD = os.environ.get("MONGO_PWD", "106ling106")
 MONGO_AUTH_DB = os.environ.get("MONGO_AUTH_DB", "admin")
 MONGO_TARGET_DB = os.environ.get("MONGO_TARGET_DB", "galv-center")
 
-# device_model: bootstrap device list + first-train source (read-only, not updated by this script)
-BASE_COLLECTION  = "device_model"
-# Retrained models destination
-STATE_COLLECTION = "device_model_new"
+# Single collection: device list, model state, and incremental updates
+MODEL_COLLECTION = "device_model"
 
 # Training params (same as production)
 TRAIN_LENGTH      = 300
@@ -138,7 +137,7 @@ def fetch_train_data(db, imei, start_ms, end_ms):
     return processed if processed else False
 
 
-def save_to_state(db, imei, doc, collection_name=STATE_COLLECTION):
+def save_to_state(db, imei, doc, collection_name=MODEL_COLLECTION):
     doc = {k: v for k, v in doc.items() if k != "_id"}
     imei_str = str(imei)
     doc["imei"] = imei_str
@@ -200,18 +199,11 @@ def resolve_output_filepath(run_end_ms):
 
 
 def load_primary_device_list(db):
-    """
-    Load IMEIs from device_model and device_model_new.
-    device_model is the bootstrap source; device_model_new-only IMEIs are still retrained.
-    """
+    """Load IMEIs from device_model only."""
     seen = {}
-    for doc in db[BASE_COLLECTION].find({}, {"_id": 0, "imei": 1}):
+    for doc in db[MODEL_COLLECTION].find({}, {"_id": 0, "imei": 1}):
         imei = str(doc.get("imei", "")).strip()
         if imei:
-            seen[imei] = {"imei": imei}
-    for doc in db[STATE_COLLECTION].find({}, {"_id": 0, "imei": 1}):
-        imei = str(doc.get("imei", "")).strip()
-        if imei and imei not in seen:
             seen[imei] = {"imei": imei}
     return [seen[k] for k in sorted(seen.keys())]
 
@@ -482,28 +474,40 @@ def _build_excel_row(imei, mode, status, old_mean_seg, best_result, old_range=""
     }
 
 
+def _has_incremental_model(model_doc):
+    """True when doc has a non-empty feature_matrix for incremental mode."""
+    if model_doc is None:
+        return False
+    matrix = model_doc.get("feature_matrix")
+    if matrix is None:
+        return False
+    try:
+        return len(matrix) > 0
+    except TypeError:
+        return False
+
+
 def process_device(work):
     """
-    work = (idx, total, base_doc, mongo_db, tprint, run_end_ms)
+    work = (idx, total, base_item, mongo_db, tprint, run_end_ms)
     First run trains on latest WINDOW_DAYS data.
     Later runs append only unseen data with the saved pen.
     """
     idx, total, base_item, mongo_db, tprint, run_end_ms = work
     imei = str(base_item.get("imei", ""))
-    base_doc = None
-    state_doc = fetch_doc_by_imei(mongo_db, STATE_COLLECTION, imei)
-    source_doc = dict(state_doc) if state_doc is not None else {}
-    if state_doc is None:
-        base_doc = fetch_doc_by_imei(mongo_db, BASE_COLLECTION, imei)
-        if base_doc is None:
-            tprint("    missing base doc -> skip")
-            return {
-                "idx": idx, "outcome": "keep_state",
-                "row": _build_excel_row(imei, "missing_base_doc", "keep_old(no_base_doc)", [], None, "", "keep_old(no_base_doc)"),
-                "counters": {"keep_state": 1},
-            }
-        source_doc = dict(base_doc)
-    has_new_model = state_doc is not None and state_doc.get("feature_matrix") is not None
+    model_doc = fetch_doc_by_imei(mongo_db, MODEL_COLLECTION, imei)
+    if model_doc is None:
+        tprint("  [{:04d}/{}] IMEI: {}  [skip] missing doc in {}".format(
+            idx, total, imei, MODEL_COLLECTION))
+        return {
+            "idx": idx, "outcome": "keep_state",
+            "row": _build_excel_row(
+                imei, "missing_doc", "keep_old(missing_doc)", [], None, "", "keep_old(missing_doc)"),
+            "counters": {"keep_state": 1},
+        }
+
+    source_doc = dict(model_doc)
+    has_new_model = _has_incremental_model(model_doc)
 
     U_close = float(source_doc.get("U_close", 0.05))
     if TRAIN_U_WAVE_OVERRIDE is None:
@@ -517,11 +521,11 @@ def process_device(work):
         old_mean_seg = []
 
     if has_new_model:
-        start_ms, end_ms = make_incremental_range_ms(state_doc.get("end"), run_end_ms)
+        start_ms, end_ms = make_incremental_range_ms(model_doc.get("end"), run_end_ms)
         mode = "incremental_fixed_pen"
     else:
         start_ms, end_ms = make_first_train_range_ms(run_end_ms)
-        mode = "first_train_from_state" if state_doc is not None else "first_train_from_base"
+        mode = "first_train"
     tprint("  [{:04d}/{}] IMEI: {}  [{}]".format(idx, total, imei, mode))
     tprint("    train_range={} ~ {}".format(ts_to_str(start_ms), ts_to_str(end_ms)))
 
@@ -531,21 +535,11 @@ def process_device(work):
     current_range = "{} ~ {}".format(ts_to_str(model_start_ms), ts_to_str(end_ms))
 
     if raw_data is False:
-        if state_doc is not None:
-            tprint("    no data -> keep existing state (no overwrite)")
-            return {
-                "idx": idx, "outcome": "keep_state",
-                "row": _build_excel_row(imei, mode, "keep_old(no_data)", old_mean_seg, None, old_range, "keep_old(no_data)"),
-                "counters": {"keep_state": 1},
-            }
-        tprint("    no data -> seed from old model once")
-        out_doc = dict(base_doc)
-        out_doc["U_wave"] = U_wave
-        save_to_state(mongo_db, imei, out_doc, collection_name=STATE_COLLECTION)
+        tprint("    no data -> keep device_model unchanged")
         return {
-            "idx": idx, "outcome": "seed_old_once",
-            "row": _build_excel_row(imei, mode, "seed_old(no_data)", old_mean_seg, None, old_range, "seed_old(no_data)"),
-            "counters": {"seed_old_once": 1},
+            "idx": idx, "outcome": "keep_state",
+            "row": _build_excel_row(imei, mode, "keep_old(no_data)", old_mean_seg, None, old_range, "keep_old(no_data)"),
+            "counters": {"keep_state": 1},
         }
 
     tprint("    data={}min".format(len(raw_data)))
@@ -553,9 +547,10 @@ def process_device(work):
     old_feat = None
     if has_new_model:
         try:
-            old_feat = np.array(state_doc.get("feature_matrix"), dtype=float)
+            old_feat = np.array(model_doc.get("feature_matrix"), dtype=float)
             if len(old_feat) == 0:
                 old_feat = None
+                has_new_model = False
         except Exception:
             old_feat = None
             has_new_model = False
@@ -566,9 +561,9 @@ def process_device(work):
     best_pen = None
     best_combined = None
     if has_new_model:
-        fixed_pen = state_doc.get("pen")
+        fixed_pen = model_doc.get("pen")
         if fixed_pen is None:
-            tprint("    missing saved pen -> keep existing state (no overwrite)")
+            tprint("    missing saved pen -> keep device_model unchanged")
             return {
                 "idx": idx, "outcome": "keep_state",
                 "row": _build_excel_row(imei, mode, "keep_old(missing_pen)", old_mean_seg, None, old_range, "keep_old(missing_pen)"),
@@ -576,7 +571,7 @@ def process_device(work):
             }
         new_feat = extract_features(raw_data, fixed_pen, U_close)
         if new_feat is None or len(new_feat) == 0:
-            tprint("    no usable new features under fixed pen -> keep existing state")
+            tprint("    no usable new features under fixed pen -> keep device_model unchanged")
             return {
                 "idx": idx, "outcome": "keep_state",
                 "row": _build_excel_row(imei, mode, "keep_old(no_new_feat)", old_mean_seg, None, old_range, "keep_old(no_new_feat)"),
@@ -603,21 +598,11 @@ def process_device(work):
                 best_combined = combined
 
     if best_result is None:
-        if state_doc is not None:
-            tprint("    train failed -> keep existing state (no overwrite)")
-            return {
-                "idx": idx, "outcome": "keep_state",
-                "row": _build_excel_row(imei, mode, "keep_old(train_fail)", old_mean_seg, None, old_range, "keep_old(train_fail)"),
-                "counters": {"keep_state": 1},
-            }
-        tprint("    train failed -> seed from old model once")
-        out_doc = dict(base_doc)
-        out_doc["U_wave"] = U_wave
-        save_to_state(mongo_db, imei, out_doc, collection_name=STATE_COLLECTION)
+        tprint("    train failed -> keep device_model unchanged")
         return {
-            "idx": idx, "outcome": "seed_old_once",
-            "row": _build_excel_row(imei, mode, "seed_old(train_fail)", old_mean_seg, None, old_range, "seed_old(train_fail)"),
-            "counters": {"seed_old_once": 1},
+            "idx": idx, "outcome": "keep_state",
+            "row": _build_excel_row(imei, mode, "keep_old(train_fail)", old_mean_seg, None, old_range, "keep_old(train_fail)"),
+            "counters": {"keep_state": 1},
         }
 
     tprint("    -> OK pen={} ss={} mean_seg={}".format(
@@ -636,7 +621,7 @@ def process_device(work):
     out_doc["end"] = end_ms
     out_doc["kmeans_model"] = pickle.dumps(best_km)
     out_doc["feature_matrix"] = best_combined.tolist() if best_combined is not None else []
-    save_to_state(mongo_db, imei, out_doc, collection_name=STATE_COLLECTION)
+    save_to_state(mongo_db, imei, out_doc)
     return {
         "idx": idx, "outcome": "retrain_ok",
         "row": _build_excel_row(
@@ -653,7 +638,7 @@ def process_device(work):
 
 
 def _merge_result_counters(counters_list):
-    keys = ["retrain_ok", "seed_old_once", "keep_state"]
+    keys = ["retrain_ok", "keep_state"]
     out = {k: 0 for k in keys}
     for c in counters_list:
         for k in c:
@@ -668,10 +653,9 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("=" * 65)
-    print("  device_model -> device_model_new scheduled retrain")
+    print("  device_model incremental retrain")
     print("  window={}d | workers={}".format(WINDOW_DAYS, WORKER_THREADS))
-    print("  base(read)={}  state(write)={}  excel={}".format(
-        BASE_COLLECTION, STATE_COLLECTION, output_file))
+    print("  collection={}  excel={}".format(MODEL_COLLECTION, output_file))
     print("  max_train_count={}".format(MAX_TRAIN_COUNT))
     print("  run_end={}".format(ts_to_str(run_end_ms)))
     print("=" * 65)
@@ -685,19 +669,17 @@ def main():
         print("  [FAIL] {}".format(e))
         return
 
-    print("\n> Loading device list from {} + {} ...".format(
-        BASE_COLLECTION, STATE_COLLECTION))
+    print("\n> Loading device list from {} ...".format(MODEL_COLLECTION))
     primary_list = load_primary_device_list(mongo_db)
     total_all = len(primary_list)
     if MAX_TRAIN_COUNT is not None and MAX_TRAIN_COUNT > 0:
         primary_list = primary_list[:MAX_TRAIN_COUNT]
     total = len(primary_list)
-    print("  total union IMEIs: {}".format(total_all))
+    print("  total IMEIs in {}: {}".format(MODEL_COLLECTION, total_all))
     print("  this run will process: {}\n".format(total))
 
     if not total:
-        print("  [FAIL] no IMEIs found in {} or {}, exit".format(
-            BASE_COLLECTION, STATE_COLLECTION))
+        print("  [FAIL] no IMEIs found in {}, exit".format(MODEL_COLLECTION))
         mongo_client.close()
         return
 
@@ -728,7 +710,6 @@ def main():
     summary = {
         "devices_processed": total,
         "retrain_ok": merged.get("retrain_ok", 0),
-        "seed_old_once": merged.get("seed_old_once", 0),
         "keep_state": merged.get("keep_state", 0),
     }
     total_elapsed_seconds = round(time.time() - run_started_at, 2)
@@ -805,35 +786,109 @@ def _write_excel(rows, filepath, summary):
 
 
 # ============================================================
-#  Scheduler
+#  Scheduler + dated logs
 # ============================================================
 
-def _append_log(log_file, message):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    with open(log_file, "a", encoding="utf-8") as fh:
-        fh.write(message.rstrip() + "\n")
-    print(message, flush=True)
+def _dated_log_path(run_dt=None):
+    run_dt = run_dt or datetime.datetime.now()
+    return os.path.join(LOG_DIR, "incremental_train_{}.log".format(run_dt.strftime("%Y%m%d")))
+
+
+def _rotate_dated_logs():
+    """Keep at most LOG_RETENTION_MAX incremental_train_YYYYMMDD.log files."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    prefix = "incremental_train_"
+    suffix = ".log"
+    dated_files = []
+    for name in os.listdir(LOG_DIR):
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        middle = name[len(prefix):-len(suffix)]
+        if len(middle) == 8 and middle.isdigit():
+            dated_files.append(os.path.join(LOG_DIR, name))
+    dated_files.sort()
+    while len(dated_files) > LOG_RETENTION_MAX:
+        try:
+            os.remove(dated_files[0])
+        except OSError as exc:
+            print("  [WARN] failed to remove old log {}: {}".format(dated_files[0], exc), flush=True)
+            break
+        dated_files = dated_files[1:]
+
+
+class _TeeStdout:
+    """Mirror stdout to a dated log file for the duration of one training run."""
+
+    def __init__(self, log_path):
+        self._stdout = sys.stdout
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+        self._file = open(log_path, "a", encoding="utf-8")
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        try:
+            self._file.close()
+        finally:
+            sys.stdout = self._stdout
+
+
+def next_sunday_midnight(from_dt=None):
+    """Next Sunday 00:00:00 strictly after from_dt (local time)."""
+    from_dt = from_dt or datetime.datetime.now()
+    today_start = from_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_until_sunday = (6 - from_dt.weekday()) % 7
+    candidate = today_start + datetime.timedelta(days=days_until_sunday)
+    if candidate <= from_dt:
+        candidate += datetime.timedelta(days=7)
+    return candidate
+
+
+def run_scheduled_batch():
+    """Execute one training batch; all detail goes to incremental_train_YYYYMMDD.log."""
+    _rotate_dated_logs()
+    log_path = _dated_log_path()
+    tee = _TeeStdout(log_path)
+    sys.stdout = tee
+    try:
+        print("=" * 65)
+        print("Incremental train run at {}".format(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        print("Log file: {}".format(log_path))
+        print("=" * 65)
+        main()
+        print("Run finished at {}".format(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("Run failed at {}".format(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    finally:
+        tee.close()
 
 
 def run_scheduler():
-    """Run one training batch on startup, then repeat every RETRAIN_INTERVAL_DAYS."""
-    log_file = os.path.join(LOG_DIR, "incremental_train.log")
-    interval_sec = RETRAIN_INTERVAL_DAYS * 24 * 60 * 60
-
-    _append_log(log_file, "Incremental train scheduler started.")
-    _append_log(log_file, "First run on startup, then every {} day(s).".format(RETRAIN_INTERVAL_DAYS))
+    """Wait until each Sunday 00:00; no training on container start."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    print("Incremental train scheduler started.", flush=True)
+    print("Schedule: every Sunday 00:00 (local). No run on deploy.", flush=True)
+    print("Logs: incremental_train_YYYYMMDD.log (max {} files).".format(LOG_RETENTION_MAX), flush=True)
 
     while True:
-        _append_log(log_file, "=" * 60)
-        _append_log(log_file, "Incremental train run at {}".format(
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %z")))
-        _append_log(log_file, "=" * 60)
-        try:
-            main()
-        except Exception as exc:
-            _append_log(log_file, "Run failed: {}".format(exc))
-        _append_log(log_file, "Next incremental train in {} day(s).".format(RETRAIN_INTERVAL_DAYS))
-        time.sleep(interval_sec)
+        nxt = next_sunday_midnight()
+        wait_sec = max(0.0, (nxt - datetime.datetime.now()).total_seconds())
+        print("Next run at {} (sleep {:.0f}s)".format(
+            nxt.strftime("%Y-%m-%d %H:%M:%S"), wait_sec), flush=True)
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        run_scheduled_batch()
 
 
 def should_run_once():
@@ -844,6 +899,6 @@ def should_run_once():
 # ============================================================
 if __name__ == "__main__":
     if should_run_once():
-        main()
+        run_scheduled_batch()
     else:
         run_scheduler()
